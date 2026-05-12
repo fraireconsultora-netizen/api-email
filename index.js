@@ -7,6 +7,15 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
+const parsePositiveNumber = (value, fallback) => {
+  const parsedValue = Number(value);
+  return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : fallback;
+};
+
+const emailRateLimitWindowMs = parsePositiveNumber(process.env.EMAIL_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000);
+const emailRateLimitMax = parsePositiveNumber(process.env.EMAIL_RATE_LIMIT_MAX, 5);
+const emailRateLimitStore = new Map();
+
 const escapeHtml = (value) =>
   String(value)
     .replace(/&/g, '&amp;')
@@ -19,6 +28,39 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
+
+const sendEmailRateLimit = (req, res, next) => {
+  const now = Date.now();
+  const clientKey = req.ip || req.socket?.remoteAddress || 'unknown';
+  const currentEntry = emailRateLimitStore.get(clientKey);
+
+  for (const [key, entry] of emailRateLimitStore.entries()) {
+    if (entry.resetAt <= now) {
+      emailRateLimitStore.delete(key);
+    }
+  }
+
+  if (!currentEntry || currentEntry.resetAt <= now) {
+    emailRateLimitStore.set(clientKey, {
+      count: 1,
+      resetAt: now + emailRateLimitWindowMs,
+    });
+
+    return next();
+  }
+
+  if (currentEntry.count >= emailRateLimitMax) {
+    const retryAfterSeconds = Math.ceil((currentEntry.resetAt - now) / 1000);
+
+    res.setHeader('Retry-After', retryAfterSeconds);
+    return res.status(429).json({
+      message: 'Alcanzaste el limite de envios. Proba nuevamente mas tarde.',
+    });
+  }
+
+  currentEntry.count += 1;
+  return next();
+};
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -50,7 +92,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // EP para enviar el mail - simplemente es hacer el post.
-app.post('/send-email', async (req, res) => {
+app.post('/send-email', sendEmailRateLimit, async (req, res) => {
   try {
     const { nombre, email, empresa, mensaje } = req.body;
 
